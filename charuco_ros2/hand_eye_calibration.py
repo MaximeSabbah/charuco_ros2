@@ -352,6 +352,332 @@ def verify_hand_eye_calibration(
     return rmse_t, rmse_r
 
 
+def average_rotations(rotations: List[np.ndarray]) -> np.ndarray:
+    """Compute the average of a list of rotation matrices.
+
+    This function computes the mean rotation matrix by
+    summing all rotation matrices and projecting the result
+    back onto the space of orthonormal matrices via a singular
+    value decomposition (SVD).  If the resulting rotation
+    matrix has a negative determinant, the last column of the
+    left singular vectors is flipped to ensure a proper
+    rotation (determinant +1).
+
+    Parameters
+    ----------
+    rotations: list of np.ndarray
+        List of 3×3 rotation matrices.
+
+    Returns
+    -------
+    np.ndarray
+        The 3×3 average rotation matrix.
+    """
+    if not rotations:
+        raise ValueError("Rotation list must not be empty")
+    S = np.zeros((3, 3), dtype=float)
+    for R in rotations:
+        S += R
+    # Compute the orthogonal factor of S via SVD
+    U, _, Vt = np.linalg.svd(S)
+    R_mean = U @ Vt
+    # Ensure a proper rotation (determinant +1)
+    if np.linalg.det(R_mean) < 0:
+        U[:, -1] *= -1
+        R_mean = U @ Vt
+    return R_mean
+
+
+def project_board_axes(
+    image: np.ndarray,
+    board: cv2.aruco.CharucoBoard,
+    k_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    axis_length: float = 0.05,
+    color: tuple[int, int, int] | None = None,
+) -> None:
+    """Draw the three coordinate axes of a ChArUco board pose on an image.
+
+    The axes are drawn at the origin of the board coordinate system and
+    extend for ``axis_length`` metres along the X (red), Y (green) and
+    Z (blue) axes.  If a specific BGR ``color`` is provided, a single
+    colour will be used for all axes; otherwise, OpenCV's default
+    colours are used.  The function modifies the input image in place.
+
+    Parameters
+    ----------
+    image: numpy.ndarray
+        The colour image onto which the axes will be drawn.
+    board: cv2.aruco.CharucoBoard
+        The ChArUco board definition (unused here but kept for
+        consistency).
+    k_matrix: numpy.ndarray
+        Camera intrinsic matrix.
+    dist_coeffs: numpy.ndarray
+        Distortion coefficients (K1…K5).  A zero vector may be
+        provided if no distortion is assumed.
+    rvec: numpy.ndarray
+        Rotation vector (Rodrigues) of the board→camera pose.
+    tvec: numpy.ndarray
+        Translation vector of the board→camera pose.
+    axis_length: float, optional
+        Length of each axis in metres.  Defaults to 0.05 m (5 cm).
+    color: tuple[int, int, int] | None, optional
+        Optional BGR colour for the axes.  If None, the axes are
+        coloured red, green and blue for X, Y and Z respectively.
+    """
+    # Define the three axis endpoints in the board coordinate system
+    axis_pts = np.float32([
+        [0, 0, 0],
+        [axis_length, 0, 0],  # X axis
+        [0, axis_length, 0],  # Y axis
+        [0, 0, axis_length],  # Z axis
+    ]).reshape(-1, 3)
+    # Project the axis points to image coordinates
+    img_pts, _ = cv2.projectPoints(axis_pts, rvec, tvec, k_matrix, dist_coeffs)
+    img_pts = img_pts.reshape(-1, 2).astype(int)
+    origin = tuple(img_pts[0])
+    # Draw lines for each axis
+    colours = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: red, green, blue
+    if color is not None:
+        colours = [color] * 3
+    for i in range(3):
+        pt = tuple(img_pts[i + 1])
+        cv2.line(image, origin, pt, colours[i], 2, cv2.LINE_AA)
+
+
+def draw_predicted_board_outline(
+    image: np.ndarray,
+    board: cv2.aruco.CharucoBoard,
+    k_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    *,
+    square_length: float,
+    colour: tuple[int, int, int] = (0, 255, 255),
+) -> None:
+    """Draw the outer rectangle of the predicted board pose on an image.
+
+    This helper projects the four outer corners of the ChArUco board
+    using the supplied pose and draws a polyline connecting them.
+
+    Parameters
+    ----------
+    image: numpy.ndarray
+        The image on which to draw.
+    board: cv2.aruco.CharucoBoard
+        The ChArUco board definition.
+    k_matrix: numpy.ndarray
+        Camera intrinsic matrix.
+    dist_coeffs: numpy.ndarray
+        Distortion coefficients.
+    rvec: numpy.ndarray
+        Rotation vector (Rodrigues) of the board→camera pose.
+    tvec: numpy.ndarray
+        Translation vector of the board→camera pose.
+    colour: tuple[int, int, int], optional
+        BGR colour of the outline.  Defaults to yellow.
+    """
+    # Compute the 3D coordinates of the four board corners (top-left, top-right, bottom-right, bottom-left)
+    w, h = board.getChessboardSize()
+    # Board corners are defined in the board coordinate system.  X axis points right, Y axis points up.
+    # The corners in OpenCV's CharucoBoard correspond to indices (0,0) at the top-left and (w-1,h-1) at the bottom-right.
+    top_left = np.array([0, 0, 0], dtype=np.float32)
+    top_right = np.array([w * square_length, 0, 0], dtype=np.float32)
+    bottom_right = np.array([w * square_length, h * square_length, 0], dtype=np.float32)
+    bottom_left = np.array([0, h * square_length, 0], dtype=np.float32)
+    corners_3d = np.stack([top_left, top_right, bottom_right, bottom_left])
+    img_pts, _ = cv2.projectPoints(corners_3d, rvec, tvec, k_matrix, dist_coeffs)
+    pts = img_pts.reshape(-1, 2).astype(int)
+    cv2.polylines(image, [pts], isClosed=True, color=colour, thickness=2, lineType=cv2.LINE_AA)
+
+
+def create_visualizations(
+    data_dir: Path,
+    R_cam2gripper: np.ndarray,
+    t_cam2gripper: np.ndarray,
+    nb_squares_x: int = 7,
+    nb_squares_y: int = 5,
+    square_length: float = 0.054,
+    marker_length: float = 0.040,
+    output_dir: Path | None = None,
+    ) -> None:
+    """Generate visual verification plots and overlay images.
+
+    This function produces two types of outputs:
+
+    1. For each captured frame, it overlays the detected ChArUco corners
+       and draws both the measured board coordinate frame and the
+       predicted board coordinate frame on top of the original image.
+       The predicted board pose is computed from the estimated
+       camera→gripper transform, the recorded robot kinematics and the
+       mean board pose across captures.  These images are saved to
+       ``output_dir`` as PNG files.
+
+    2. A 3D plot of the reconstructed board poses (target→base) for all
+       valid captures.  Each pose is visualised as a coordinate frame
+       anchored at the board origin.  The average pose is drawn in
+       heavier lines.  The plot is saved as ``board_poses.png`` in
+       ``output_dir``.
+
+    Parameters
+    ----------
+    data_dir: pathlib.Path
+        Directory containing ``image_data_*.pkl`` files.
+    R_cam2gripper, t_cam2gripper: numpy.ndarray
+        Estimated camera→gripper rotation matrix and translation vector.
+    nb_squares_x, nb_squares_y: int, optional
+        Number of squares along the X and Y dimensions of the ChArUco board.
+    square_length, marker_length: float, optional
+        Dimensions of the squares and markers in metres.
+    output_dir: pathlib.Path | None, optional
+        Directory where visualisations will be saved.  If ``None``, a
+        subdirectory called ``visuals`` inside ``data_dir`` will be
+        created.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # Use non‑interactive backend
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    files = load_pickle_files(data_dir)
+    if not files:
+        raise RuntimeError(f"No pickle files found in {data_dir}")
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
+    board = cv2.aruco.CharucoBoard((nb_squares_x, nb_squares_y), square_length, marker_length, dictionary)
+    # Compute gripper→camera from the extrinsic
+    R_g2c = R_cam2gripper.T
+    t_g2c = -R_cam2gripper.T @ t_cam2gripper
+    rotations_b_t: List[np.ndarray] = []
+    translations_b_t: List[np.ndarray] = []
+    detections: List[Tuple[Path, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    # Gather board→base poses and detection results
+    for path in files:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        image = data["image_rgb"].copy()
+        k_matrix = np.array(data["k_rgb"], dtype=float).reshape(3, 3)
+        base_transform = np.array(data["base_transform"], dtype=float)
+        # Compute base→camera transform (camera→base is R_b_c, t_b_c; base→camera is its inverse)
+        R_b_g = base_transform[:3, :3]
+        t_b_g = base_transform[:3, 3:4]
+        R_b_c = R_b_g @ R_g2c
+        t_b_c = R_b_g @ t_g2c + t_b_g
+        # board pose from detection
+        pose = detect_charuco_pose(image, k_matrix, board)
+        if pose is None:
+            continue
+        R_t2c, t_t2c = pose  # board→camera
+        # Compute board→base via composition: board→base = board→camera followed by camera→base
+        R_c2t = R_t2c.T
+        t_c2t = -R_t2c.T @ t_t2c
+        R_b_t = R_b_c @ R_c2t
+        t_b_t = R_b_c @ t_c2t + t_b_c
+        rotations_b_t.append(R_b_t)
+        translations_b_t.append(t_b_t.reshape(3))
+        # Store detection details for later visualisation
+        detections.append((path, image, k_matrix, R_t2c, t_t2c, R_b_c, t_b_c))
+    if len(rotations_b_t) < 2:
+        raise RuntimeError("Visualisation requires at least two valid captures.")
+    # Compute mean board→base pose
+    R_b_t_mean = average_rotations(rotations_b_t)
+    t_b_t_mean = np.mean(np.stack(translations_b_t), axis=0).reshape(3, 1)
+    # Prepare output directory
+    if output_dir is None:
+        output_dir = data_dir / "visuals"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Loop through detections and produce overlay images
+    for i, (path, image, k_matrix, R_t2c, t_t2c, R_b_c, t_b_c) in enumerate(detections):
+        # Draw detected ChArUco corners and axes (ground truth) on a copy of the image
+        img_det = image.copy()
+        # Re-run Charuco detection to obtain corners and IDs for drawing
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        charuco_detector = cv2.aruco.CharucoDetector(board)
+        charuco_corners, charuco_ids, marker_corners, marker_ids = charuco_detector.detectBoard(gray)
+        if charuco_corners is not None and charuco_ids is not None:
+            cv2.aruco.drawDetectedCornersCharuco(img_det, charuco_corners, charuco_ids, (0, 255, 0))
+            # Draw detected markers if available
+            if marker_corners is not None:
+                cv2.aruco.drawDetectedMarkers(img_det, marker_corners, marker_ids)
+        # Draw the measured coordinate frame on the detected pose
+        rvec_det, _ = cv2.Rodrigues(R_t2c)
+        tvec_det = t_t2c.copy()
+        project_board_axes(img_det, board, k_matrix, np.zeros((5, 1), dtype=float), rvec_det, tvec_det, axis_length=0.04)
+        # Draw predicted coordinate frame using mean board pose and base→camera
+        # Compute base→camera inverse (camera→base is R_b_c; base→camera is its inverse)
+        R_c_b = R_b_c.T
+        t_c_b = -R_b_c.T @ t_b_c
+        # Predicted board→camera: board→base then base→camera
+        R_pred = R_c_b @ R_b_t_mean
+        t_pred = R_c_b @ t_b_t_mean + t_c_b
+        rvec_pred, _ = cv2.Rodrigues(R_pred)
+        tvec_pred = t_pred.copy()
+        project_board_axes(img_det, board, k_matrix, np.zeros((5, 1), dtype=float), rvec_pred, tvec_pred, axis_length=0.04, color=(255, 255, 0))
+        # Optionally draw the predicted board outline
+        draw_predicted_board_outline(
+            img_det,
+            board,
+            k_matrix,
+            np.zeros((5, 1), dtype=float),
+            rvec_pred,
+            tvec_pred,
+            square_length=square_length,
+            colour=(255, 255, 0),
+        )
+        # Save the annotated image
+        out_path = output_dir / f"frame_{i:03d}.png"
+        cv2.imwrite(str(out_path), img_det)
+    # Create a 3D plot of all board poses in base coordinates
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    # Plot each pose as a coordinate frame
+    def draw_frame(ax, origin: np.ndarray, R: np.ndarray, length: float = 0.05, lw: float = 1.0):
+        # Axes: X (red), Y (green), Z (blue)
+        colours = ['r', 'g', 'b']
+        for i in range(3):
+            axis = R[:, i] * length
+            ax.plot(
+                [origin[0], origin[0] + axis[0]],
+                [origin[1], origin[1] + axis[1]],
+                [origin[2], origin[2] + axis[2]],
+                color=colours[i],
+                linewidth=lw,
+            )
+    # Draw each reconstructed pose
+    for R_b_t, t_b_t in zip(rotations_b_t, translations_b_t):
+        draw_frame(ax, t_b_t, R_b_t, length=0.04, lw=1.0)
+    # Draw the mean pose with thicker lines
+    draw_frame(ax, t_b_t_mean.flatten(), R_b_t_mean, length=0.05, lw=2.0)
+    # Scatter the origins of all poses
+    poses_np = np.stack(translations_b_t)
+    ax.scatter(poses_np[:, 0], poses_np[:, 1], poses_np[:, 2], c='k', marker='o', s=8, label='Board poses')
+    # Label axes and set equal aspect ratios
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('Reconstructed board poses (base frame)')
+    # Set equal scaling
+    max_range = np.array([
+        poses_np[:, 0].max() - poses_np[:, 0].min(),
+        poses_np[:, 1].max() - poses_np[:, 1].min(),
+        poses_np[:, 2].max() - poses_np[:, 2].min(),
+    ]).max() / 2.0
+    mid_x = (poses_np[:, 0].max() + poses_np[:, 0].min()) / 2.0
+    mid_y = (poses_np[:, 1].max() + poses_np[:, 1].min()) / 2.0
+    mid_z = (poses_np[:, 2].max() + poses_np[:, 2].min()) / 2.0
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    ax.legend(loc='upper right')
+    plt.tight_layout()
+    fig_path = output_dir / "board_poses.png"
+    fig.savefig(fig_path)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -366,6 +692,17 @@ def main() -> None:
         help=(
             "Directory containing image_data_*.pkl files produced by "
             "image_saver_calibration.py"
+        ),
+    )
+
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help=(
+            "Generate visual verification outputs.  Annotated images with detected "
+            "and predicted board poses will be saved to a 'visuals' subdirectory, "
+            "and a 3D plot of reconstructed board poses will be created.  This "
+            "option requires Matplotlib to be available."
         ),
     )
     parser.add_argument(
@@ -417,6 +754,28 @@ def main() -> None:
         )
     except RuntimeError as e:
         print(f"Verification skipped: {e}")
+
+    # Generate visualisations if requested
+    if args.visualize:
+        try:
+            create_visualizations(
+                args.data_dir,
+                R_cam2gripper,
+                t_cam2gripper,
+                nb_squares_x=7,
+                nb_squares_y=5,
+                square_length=0.054,
+                marker_length=0.040,
+                output_dir=None,
+            )
+            print()
+            print(
+                "Visualisations saved to the 'visuals' directory within the data directory. "
+                "Use these images to inspect detected and predicted board poses and the "
+                "3D distribution of board poses in the base frame."
+            )
+        except Exception as exc:
+            print(f"Visualisation generation failed: {exc}")
 
 
 if __name__ == "__main__":
