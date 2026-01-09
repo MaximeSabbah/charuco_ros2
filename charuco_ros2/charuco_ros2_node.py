@@ -3,7 +3,8 @@ import rclpy
 from rclpy.node import Node
 
 import numpy as np
-import quaternion
+# import quaternion
+import pinocchio as pin
 import cv2
 from cv2 import aruco
 from cv_bridge import CvBridge
@@ -19,12 +20,12 @@ class CharucoDetector(Node):
         super().__init__("charuco_detector")
 
         # --- Board configuration ---
-        self.dictionary_id = aruco.DICT_5X5_1000
+        self.dictionary_id = aruco.DICT_4X4_1000
         self.charuco_dict = aruco.getPredefinedDictionary(self.dictionary_id)
-        nb_squares_x, nb_squares_y = 12, 9
-        square_length = 0.030
-        marker_length = 0.022
-        self.board = cv2.aruco.CharucoBoard((nb_squares_x, nb_squares_y), square_length, marker_length, self.charuco_dict)
+        nb_squares_x, nb_squares_y = 7, 5
+        square_length = 0.054
+        marker_length = 0.040
+        self.board = cv2.aruco.CharucoBoard_create(nb_squares_x, nb_squares_y, square_length, marker_length, self.charuco_dict)
 
         # Save to PNG for debug
         # img = self.board.generateImage((2000, 2800))
@@ -148,11 +149,12 @@ def np_mat_to_transform(t: np.ndarray, R: np.ndarray) -> Transform:
     transform.translation.z = float(t[2])
 
     # Extract rotation as quaternion
-    q = quaternion.from_rotation_matrix(R)
-    transform.rotation.x = q.x
-    transform.rotation.y = q.y
-    transform.rotation.z = q.z
-    transform.rotation.w = q.w
+    # q = quaternion.from_rotation_matrix(R)
+    q = pin.Quaternion(R).coeffs()
+    transform.rotation.x = q[0]
+    transform.rotation.y = q[1]
+    transform.rotation.z = q[2]
+    transform.rotation.w = q[3]
 
     return transform
 
