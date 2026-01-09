@@ -21,7 +21,8 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'charuco_ros2_node = charuco_ros2.charuco_ros2_node:main'
+            'charuco_ros2_node = charuco_ros2.charuco_ros2_node:main',
+            'image_saver_calibration = charuco_ros2.image_saver_calibration:main',
         ],
     },
 )
