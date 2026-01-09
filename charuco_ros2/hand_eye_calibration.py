@@ -149,9 +149,8 @@ def run_hand_eye_calibration(
         with open(path, "rb") as f:
             data = pickle.load(f)
         base_transform = np.array(data["base_transform"], dtype=float)
-        R_g2b, t_g2b = invert_transform(base_transform)
-        R_gripper2base_list.append(R_g2b)
-        t_gripper2base_list.append(t_g2b)
+        R_b2g = base_transform[:3, :3]
+        t_b2g = base_transform[:3, 3:4]
         image = data["image_rgb"]
         if k_matrix_override is not None:
             k_matrix = k_matrix_override
@@ -166,6 +165,8 @@ def run_hand_eye_calibration(
         if pose is None:
             continue
         R_t2c, t_t2c = pose
+        R_gripper2base_list.append(R_b2g)
+        t_gripper2base_list.append(t_b2g)
         R_target2cam_list.append(R_t2c)
         t_target2cam_list.append(t_t2c)
     n = len(R_target2cam_list)
@@ -481,15 +482,16 @@ def draw_predicted_board_outline(
     colour: tuple[int, int, int], optional
         BGR colour of the outline.  Defaults to yellow.
     """
-    # Compute the 3D coordinates of the four board corners (top-left, top-right, bottom-right, bottom-left)
-    w, h = board.getChessboardSize()
-    # Board corners are defined in the board coordinate system.  X axis points right, Y axis points up.
-    # The corners in OpenCV's CharucoBoard correspond to indices (0,0) at the top-left and (w-1,h-1) at the bottom-right.
-    top_left = np.array([0, 0, 0], dtype=np.float32)
-    top_right = np.array([w * square_length, 0, 0], dtype=np.float32)
-    bottom_right = np.array([w * square_length, h * square_length, 0], dtype=np.float32)
-    bottom_left = np.array([0, h * square_length, 0], dtype=np.float32)
-    corners_3d = np.stack([top_left, top_right, bottom_right, bottom_left])
+    chess = board.getChessboardCorners().astype(np.float32)  # (N,3)
+    # outer corners in board coordinates
+    x_min, y_min = chess[:,0].min(), chess[:,1].min()
+    x_max, y_max = chess[:,0].max(), chess[:,1].max()
+    corners_3d = np.array([
+        [x_min, y_min, 0],
+        [x_max, y_min, 0],
+        [x_max, y_max, 0],
+        [x_min, y_max, 0],
+    ], dtype=np.float32)
     img_pts, _ = cv2.projectPoints(corners_3d, rvec, tvec, k_matrix, dist_coeffs)
     pts = img_pts.reshape(-1, 2).astype(int)
     cv2.polylines(image, [pts], isClosed=True, color=colour, thickness=2, lineType=cv2.LINE_AA)
@@ -613,8 +615,10 @@ def create_visualizations(
         # Predicted board→camera: board→base then base→camera
         R_pred = R_c_b @ R_b_t_mean
         t_pred = R_c_b @ t_b_t_mean + t_c_b
-        rvec_pred, _ = cv2.Rodrigues(R_pred)
-        tvec_pred = t_pred.copy()
+        R_t2c_pred = R_pred.T
+        t_t2c_pred = -R_pred.T @ t_pred
+        rvec_pred, _ = cv2.Rodrigues(R_t2c_pred)
+        tvec_pred = t_t2c_pred.copy()
         project_board_axes(img_det, board, k_matrix, np.zeros((5, 1), dtype=float), rvec_pred, tvec_pred, axis_length=0.04, color=(255, 255, 0))
         # Optionally draw the predicted board outline
         draw_predicted_board_outline(
