@@ -149,8 +149,10 @@ def run_hand_eye_calibration(
         with open(path, "rb") as f:
             data = pickle.load(f)
         base_transform = np.array(data["base_transform"], dtype=float)
-        R_b2g = base_transform[:3, :3]
-        t_b2g = base_transform[:3, 3:4]
+        # The logger stores TF lookup_transform(target=base, source=gripper), i.e. gripper→base.
+        # OpenCV calibrateHandEye expects gripper→base as well.
+        R_g2b = base_transform[:3, :3]
+        t_g2b = base_transform[:3, 3:4]
         image = data["image_rgb"]
         if k_matrix_override is not None:
             k_matrix = k_matrix_override
@@ -165,8 +167,8 @@ def run_hand_eye_calibration(
         if pose is None:
             continue
         R_t2c, t_t2c = pose
-        R_gripper2base_list.append(R_b2g)
-        t_gripper2base_list.append(t_b2g)
+        R_gripper2base_list.append(R_g2b)
+        t_gripper2base_list.append(t_g2b)
         R_target2cam_list.append(R_t2c)
         t_target2cam_list.append(t_t2c)
     n = len(R_target2cam_list)
@@ -329,24 +331,22 @@ def verify_hand_eye_calibration(
         if pose is None:
             continue
         R_t2c, t_t2c = pose
-        R_c2t = R_t2c.T
-        t_c2t = -R_t2c.T @ t_t2c
-        R_b_t = R_b_c @ R_c2t
-        t_b_t = R_b_c @ t_c2t + t_b_c
+        # Compose: base<-target = (base<-camera) * (camera<-target)
+        R_b_t = R_b_c @ R_t2c
+        t_b_t = R_b_c @ t_t2c + t_b_c
         translations.append(t_b_t.reshape(3))
         rotations.append(R_b_t)
     if len(translations) < 2:
         raise RuntimeError("Verification requires at least two valid captures.")
     translations_np = np.stack(translations)
     t_mean = translations_np.mean(axis=0)
-    R_ref = rotations[0]
+    R_mean = average_rotations(rotations)
     angle_errors = []
     for R_i in rotations:
-        delta_R = R_ref.T @ R_i
+        delta_R = R_mean.T @ R_i
         # Clamp trace to avoid numerical issues
         angle = np.arccos(max(min((np.trace(delta_R) - 1.0) / 2.0, 1.0), -1.0))
-        angle_deg = np.degrees(angle)
-        angle_errors.append(angle_deg)
+        angle_errors.append(float(np.degrees(angle)))
     t_errors = np.linalg.norm(translations_np - t_mean, axis=1)
     rmse_t = float(np.sqrt(np.mean(t_errors ** 2)))
     rmse_r = float(np.sqrt(np.mean(np.array(angle_errors) ** 2)))
@@ -573,11 +573,9 @@ def create_visualizations(
         if pose is None:
             continue
         R_t2c, t_t2c = pose  # board→camera
-        # Compute board→base via composition: board→base = board→camera followed by camera→base
-        R_c2t = R_t2c.T
-        t_c2t = -R_t2c.T @ t_t2c
-        R_b_t = R_b_c @ R_c2t
-        t_b_t = R_b_c @ t_c2t + t_b_c
+        # Compute base<-target via composition: base<-target = (base<-camera) * (camera<-target)
+        R_b_t = R_b_c @ R_t2c
+        t_b_t = R_b_c @ t_t2c + t_b_c
         rotations_b_t.append(R_b_t)
         translations_b_t.append(t_b_t.reshape(3))
         # Store detection details for later visualisation
@@ -609,14 +607,12 @@ def create_visualizations(
         tvec_det = t_t2c.copy()
         project_board_axes(img_det, board, k_matrix, np.zeros((5, 1), dtype=float), rvec_det, tvec_det, axis_length=0.04)
         # Draw predicted coordinate frame using mean board pose and base→camera
-        # Compute base→camera inverse (camera→base is R_b_c; base→camera is its inverse)
+        # Compute camera<-base (inverse of base<-camera)
         R_c_b = R_b_c.T
         t_c_b = -R_b_c.T @ t_b_c
-        # Predicted board→camera: board→base then base→camera
-        R_pred = R_c_b @ R_b_t_mean
-        t_pred = R_c_b @ t_b_t_mean + t_c_b
-        R_t2c_pred = R_pred.T
-        t_t2c_pred = -R_pred.T @ t_pred
+        # Predicted camera<-target: (camera<-base) * (base<-target_mean)
+        R_t2c_pred = R_c_b @ R_b_t_mean
+        t_t2c_pred = R_c_b @ t_b_t_mean + t_c_b
         rvec_pred, _ = cv2.Rodrigues(R_t2c_pred)
         tvec_pred = t_t2c_pred.copy()
         project_board_axes(img_det, board, k_matrix, np.zeros((5, 1), dtype=float), rvec_pred, tvec_pred, axis_length=0.04, color=(255, 255, 0))
